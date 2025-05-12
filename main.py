@@ -24,7 +24,15 @@ if __name__ == '__main__':
             print(f"generating new seeds...\n")
         else:
             daemon.realign()
-        multifuzz.run_fuzzer(target)
+        # 异步模式启动 MultiFuzz
+        fuzzer_process = multifuzz.run_fuzzer(target, asynchronous=True)
+
+        # 一段时间后需要停止 fuzzer
+        if multifuzz.stop_fuzzer(fuzzer_process):
+            print("Fuzzer stopped successfully\n")
+        else:
+            print("Failed to stop fuzzer\n")
+
         feedback = daemon.collect_feedback()
         llm_agent.fix_prompt(feedback)
         llm_agent.update_generator()
