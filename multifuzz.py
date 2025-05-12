@@ -1,39 +1,38 @@
 '''
 作为接口启动 MultiFuzz
 '''
-import os
-import time
-from pathlib import Path
+
 import subprocess
+import signal
+import os
 
-def run_fuzzer(target) -> dict:
-    """启动 MultiFuzz 并返回执行结果"""
+# 全局变量，存储当前运行的 fuzzer 进程
+current_fuzzer_process = None
 
-    # 确保工作目录存在
-    workdir_path = os.path.join(target, 'workdir')
-    workdir = os.environ.get("WORKDIR", workdir_path)
-    Path(workdir).mkdir(parents=True, exist_ok=True)
-
+def run_fuzzer(target, asynchronous=False):
+    """
+    启动 Fuzzer 进程
+    参数:
+        target: 目标固件路径
+        asynchronous: 是否异步运行
+    返回:
+        进程对象(异步模式)或执行结果(同步模式)
+    """
+    global current_fuzzer_process
+    
     # 设置环境变量
     env = os.environ.copy()
     env["RESUME"] = "true"
     env["RUN_FOR"] = "24h"
-    env["WORKDIR"] = workdir
-
+    env["WORKDIR"] = f"{target}/workdir"
+    
     # 构建命令
     cmd = ["cargo", "run", "--release", "--", target]
-
-    print(f"Starting MultiFuzz with command: {' '.join(cmd)}")
-    print(f"Environment variables:")
-    print(f"  RESUME: {env['RESUME']}")
-    print(f"  RUN_FOR: {env['RUN_FOR']}")
-    print(f"  WORKDIR: {env['WORKDIR']}")
-
-    # 启动进程
+    
+    print(f"Starting fuzzer with command: {' '.join(cmd)}")
+    
     try:
-        start_time = time.time()
-        
-        # 启动命令并捕获输出
+        # 启动进程
         process = subprocess.Popen(
             cmd,
             env=env,
@@ -43,66 +42,61 @@ def run_fuzzer(target) -> dict:
             bufsize=1
         )
         
-        # 实时输出日志
-        log_file = os.path.join(workdir, "multifuzz.log")
-        with open(log_file, "w") as f:
-            for line in iter(process.stdout.readline, ''):
-                print(line, end='')
-                f.write(line)
+        # 存储当前进程
+        current_fuzzer_process = process
         
-        # 等待进程完成
-        process.wait()
-        
-        end_time = time.time()
-        duration = end_time - start_time
-        
-        # 检查返回码
-        if process.returncode != 0:
-            print(f"Failed to run MultiFuzz, Caused by: {process.returncode}")
-        
-        # 收集基本结果
-        results = {
-            "return_code": process.returncode,
-            "duration_seconds": duration,
-            "start_time": time.ctime(start_time),
-            "end_time": time.ctime(end_time),
-            "workdir": workdir,
-            "log_file": log_file
-        }
-        
-        # 尝试收集更多结果
-        try:
-            # 收集找到的崩溃数量
-            crashes_dir = os.path.join(workdir, "crashes")
-            if os.path.exists(crashes_dir):
-                crashes = len([f for f in os.listdir(crashes_dir) if os.path.isfile(os.path.join(crashes_dir, f))])
-                results["crashes"] = crashes
+        if asynchronous:
+            # 异步模式直接返回进程
+            return process
+        else:
+            # 同步模式等待进程完成
+            output, _ = process.communicate()
+            return {
+                "returncode": process.returncode,
+                "output": output
+            }
             
-            # 收集找到的超时数量
-            timeouts_dir = os.path.join(workdir, "timeouts")
-            if os.path.exists(timeouts_dir):
-                timeouts = len([f for f in os.listdir(timeouts_dir) if os.path.isfile(os.path.join(timeouts_dir, f))])
-                results["timeouts"] = timeouts
-            
-            # 收集执行的总输入数量
-            queue_dir = os.path.join(workdir, "queue")
-            if os.path.exists(queue_dir):
-                total_inputs = len([f for f in os.listdir(queue_dir) if os.path.isfile(os.path.join(queue_dir, f))])
-                results["total_inputs"] = total_inputs
-                
-        except Exception as e:
-            print(f"收集详细结果时出错: {e}")
-        
-        return results
-        
     except Exception as e:
-        print(f"启动MultiFuzz时出错: {e}")
-        return {
-            "error": str(e),
-            "return_code": -1
-        }
-    
+        print(f"Failed to start fuzzer: {e}")
+        return None
 
-def stop_fuzzer():
-    '''停止 MultiFuzz, 用于覆盖率长期无变化时'''
-    pass
+def stop_fuzzer(process=None):
+    """
+    停止当前正在运行的 fuzzer 进程
+    参数:
+        process: 可选的进程对象，如果未提供，则使用全局存储的进程
+    """
+    global current_fuzzer_process
+    
+    # 如果未提供进程，使用全局存储的进程
+    if process is None:
+        process = current_fuzzer_process
+    
+    if process is None:
+        print("No running fuzzer process to stop")
+        return False
+    
+    try:
+        print("Stopping fuzzer process...")
+        
+        # 首先尝试发送 SIGINT (Ctrl+C)，给进程优雅退出的机会
+        process.send_signal(signal.SIGINT)
+        
+        # 等待进程退出
+        try:
+            process.wait(timeout=30)  # 等待 30 秒
+            print(f"Fuzzer process stopped with return code {process.returncode}")
+            current_fuzzer_process = None
+            return True
+        except subprocess.TimeoutExpired:
+            # 如果 30 秒后仍未退出，发送 SIGKILL 强制终止
+            print("Fuzzer did not stop gracefully, sending SIGKILL")
+            process.kill()
+            process.wait()  # 确保进程已终止
+            print(f"Fuzzer process killed with return code {process.returncode}")
+            current_fuzzer_process = None
+            return True
+            
+    except Exception as e:
+        print(f"Error stopping fuzzer process: {e}")
+        return False
